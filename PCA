@@ -1,0 +1,275 @@
+// ============================================================
+// VARANASI PHENOLOGY-CHECKPOINT FEATURE STACK (18 bands)
+// Orbit 92, Descending, Kharif 2025
+// Checkpoints snapped to actual acquisitions
+// ============================================================
+
+var roi = table.geometry().bounds();
+Map.centerObject(table, 9);
+Map.addLayer(table, {color: 'yellow', fillColor: 'ffff0040'}, 'Study Area');
+
+function removeThermalNoise(img) {
+  return img.updateMask(img.select('VV').gt(0.0001).and(img.select('VH').gt(0.0001)));
+}
+
+function removeBorderNoise(img) {
+  // GRD border noise appears as artificially low/high values near swath edges,
+  // typically manifesting as near-zero or saturated pixels along scene boundaries.
+  // Erode the image edges slightly to drop the worst-affected border pixels.
+  var edge = ee.Image.constant(1).clip(img.geometry()).mask();
+  var erodedMask = edge.focal_min({radius: 500, units: 'meters'});
+  return img.updateMask(erodedMask);
+}
+
+
+function applyAllMasks(img) {
+  img = removeThermalNoise(img);
+  img = removeBorderNoise(img);
+  return img;
+}
+
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD_FLOAT')
+  .filterBounds(roi)
+  .filterDate('2025-06-01', '2025-11-01')
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
+  .filter(ee.Filter.eq('relativeOrbitNumber_start', 92))
+  .select(['VV', 'VH'])
+  .map(applyAllMasks);
+print('Bands available:', s1.first().bandNames());
+print('Total S1 images in season (Orbit 92 Desc, Kharif):', s1.size());
+
+function getImageByDate(dateStr) {
+  var start = ee.Date(dateStr);
+  var end = start.advance(1, 'day');
+  var img = s1.filterDate(start, end).median();
+  var vv = img.select('VV').focal_median({radius: 2, kernelType: 'square', units: 'pixels'});
+  var vh = img.select('VH').focal_median({radius: 2, kernelType: 'square', units: 'pixels'});
+  return vv.addBands(vh).rename(['VV', 'VH']);
+}
+
+function computeMRVI(img) {
+  var vv = img.select('VV');
+  var vh = img.select('VH');
+  return img.addBands(
+    vv.addBands(vh).expression(
+      'sqrt(VV / (VV + VH)) * ((4 * VH) / (VV + VH))',
+      {VV: vv, VH: vh}
+    ).rename('mRVI')
+  );
+}
+
+function computeVH_VV_ratio(img) {
+  var vv = img.select('VV');
+  var vh = img.select('VH');
+  return img.addBands(vh.divide(vv.add(1e-6)).rename('VH_VV_ratio'));
+}
+
+function computeVV_VH_diff(img) {
+  var vv_db = img.select('VV').log10().multiply(10);
+  var vh_db = img.select('VH').log10().multiply(10);
+  return img.addBands(vv_db.subtract(vh_db).rename('VV_VH_diff'));
+}
+
+function toDB(img) {
+  return img.log10().multiply(10);
+}
+
+// ============================================================
+// STEP 1.3 — June 4 (pre-monsoon baseline)
+// ============================================================
+var jun_image = getImageByDate('2025-06-04');
+var VV_Jun = toDB(jun_image.select('VV')).rename('VV_Jun');
+var VH_Jun = toDB(jun_image.select('VH')).rename('VH_Jun');
+var VV_VH_diff_Jun = computeVV_VH_diff(jun_image).select('VV_VH_diff').rename('VV_VH_diff_Jun');
+
+// ============================================================
+// STEP 1.4 — July 10 (transplanting/flooding signature)
+// ============================================================
+var jul_image = getImageByDate('2025-07-10');
+var mRVI_Jul = computeMRVI(jul_image).select('mRVI').rename('mRVI_Jul');
+var VH_VV_ratio_Jul = computeVH_VV_ratio(jul_image).select('VH_VV_ratio').rename('VH_VV_ratio_Jul');
+var VH_Jul = toDB(jul_image.select('VH')).rename('VH_Jul');
+
+// ============================================================
+// STEP 1.5 — August 3 (active vegetative growth)
+// ============================================================
+var aug_image = getImageByDate('2025-08-03');
+var mRVI_Aug = computeMRVI(aug_image).select('mRVI').rename('mRVI_Aug');
+var VV_VH_diff_Aug = computeVV_VH_diff(aug_image).select('VV_VH_diff').rename('VV_VH_diff_Aug');
+var VV_Aug = toDB(aug_image.select('VV')).rename('VV_Aug');
+
+// ============================================================
+// STEP 1.6 — September 8 (peak biomass)
+// ============================================================
+var sep_image = getImageByDate('2025-09-08');
+var VH_Sep = toDB(sep_image.select('VH')).rename('VH_Sep');
+var VV_VH_diff_Sep = computeVV_VH_diff(sep_image).select('VV_VH_diff').rename('VV_VH_diff_Sep');
+var mRVI_Sep = computeMRVI(sep_image).select('mRVI').rename('mRVI_Sep');
+
+// ============================================================
+// STEP 1.7 — October 2 (senescence begins) + seasonal mRVI stdDev
+// ============================================================
+var oct_image = getImageByDate('2025-10-02');
+var mRVI_Oct = computeMRVI(oct_image).select('mRVI').rename('mRVI_Oct');
+var VH_VV_ratio_Oct = computeVH_VV_ratio(oct_image).select('VH_VV_ratio').rename('VH_VV_ratio_Oct');
+
+var mrviCollection = s1.map(function(img) {
+  return computeMRVI(img).select('mRVI');
+});
+var mRVI_stdDev = mrviCollection.reduce(ee.Reducer.stdDev()).rename('mRVI_stdDev');
+
+// ============================================================
+// STEP 1.8 — October 26 (pre-harvest/late season)
+// ============================================================
+var oct2_image = getImageByDate('2025-10-26');
+var VV_OctLate = toDB(oct2_image.select('VV')).rename('VV_OctLate');
+var mRVI_OctLate = computeMRVI(oct2_image).select('mRVI').rename('mRVI_OctLate');
+var VH_VV_ratio_OctLate = computeVH_VV_ratio(oct2_image).select('VH_VV_ratio').rename('VH_VV_ratio_OctLate');
+
+// ============================================================
+// STEP 1.9 — Stack all 18 features
+// ============================================================
+var stacked = ee.Image.cat([
+  VV_Jun, VH_Jun, VV_VH_diff_Jun,
+  mRVI_Jul, VH_VV_ratio_Jul, VH_Jul,
+  mRVI_Aug, VV_VH_diff_Aug, VV_Aug,
+  VH_Sep, VV_VH_diff_Sep, mRVI_Sep,
+  mRVI_Oct, VH_VV_ratio_Oct, mRVI_stdDev,
+  VV_OctLate, mRVI_OctLate, VH_VV_ratio_OctLate
+]).clip(table);
+
+// ============================================================
+// WorldCover crop mask
+// ============================================================
+var worldcover = ee.ImageCollection('ESA/WorldCover/v200').first().clip(table);
+var treeMask  = worldcover.eq(10);
+var urbanMask = worldcover.eq(50);
+var waterMask = worldcover.eq(80);
+var cropMask = treeMask.or(urbanMask).or(waterMask).not();
+
+var stacked_masked = stacked.updateMask(cropMask);
+
+// ============================================================
+// STEP 1.10 — Z-score normalize
+// ============================================================
+var bandNames = stacked_masked.bandNames();
+
+var stats = stacked_masked.reduceRegion({
+  reducer: ee.Reducer.mean().combine({
+    reducer2: ee.Reducer.stdDev(),
+    sharedInputs: true
+  }),
+  geometry: roi,
+  scale: 20,
+  maxPixels: 1e13,
+  tileScale: 16,
+  bestEffort: true
+});
+
+var meanImage = ee.Image.constant(bandNames.map(function(b){ return stats.get(ee.String(b).cat('_mean')); })).rename(bandNames);
+var stdImage  = ee.Image.constant(bandNames.map(function(b){ return stats.get(ee.String(b).cat('_stdDev')); })).rename(bandNames);
+
+var normalized = stacked_masked.subtract(meanImage).divide(stdImage);
+
+print('Normalized 18-band image ready (Varanasi, Orbit 92 Desc, Kharif 2025).');
+
+// ============================================================
+// STEP 1.10B — Export RAW (pre-normalization) 18-band stack
+// ============================================================
+Export.image.toDrive({
+  image: stacked_masked,
+  description: 'Varanasi_Kharif_2025_18features_RAW',
+  folder: 'gee_exports',
+  fileNamePrefix: 'Varanasi_18bands_RAW_Kharif_2025',
+  scale: 20,
+  crs: 'EPSG:32644',
+  maxPixels: 1e13,
+  region: roi
+});
+
+print('✅ Export queued: Varanasi_18bands_RAW_Kharif_2025.tif');
+
+// ============================================================
+// STEP 1.11 — Export normalized
+// ============================================================
+Export.image.toDrive({
+  image: normalized,
+  description: 'Varanasi_Kharif_2025_18features_monthlyAdaptive',
+  folder: 'gee_exports',
+  fileNamePrefix: 'Varanasi_18bands_Kharif_2025',
+  scale: 20,
+  crs: 'EPSG:32644',
+  maxPixels: 1e13,
+  region: roi
+});
+
+print('✅ Export queued: Varanasi_18bands_Kharif_2025.tif');
+
+// ============================================================
+// PCA on 18-band phenology-checkpoint stack (Kharif 2025)
+// ============================================================
+// ============================================================
+// PCA on 18-band phenology-checkpoint stack (Kharif 2025)
+// ============================================================
+var bandNames = normalized.bandNames();
+var arrays = normalized.toArray();
+
+var covar = arrays.reduceRegion({
+  reducer: ee.Reducer.centeredCovariance(),
+  geometry: roi,
+  scale: 20,
+  maxPixels: 1e13,
+  tileScale: 16,
+  bestEffort: true
+});
+
+var covarArray   = ee.Array(covar.get('array'));
+var eigens       = covarArray.eigen();
+var eigenValues  = eigens.slice(1, 0, 1);
+var eigenVectors = eigens.slice(1, 1);
+
+var eigenValues1D = eigenValues.project([0]);
+var totalVariance = eigenValues1D.reduce(ee.Reducer.sum(), [0]).get([0]);
+var explainedVar  = eigenValues1D.divide(totalVariance).multiply(100);
+
+print('Explained variance % (all 18 components, Kharif 2025):', explainedVar);
+
+var cumulativeVar = ee.Array(explainedVar).accum(0);
+print('Cumulative variance % (Kharif 2025):', cumulativeVar);
+var nComponents = 8;
+
+var arrayImage = normalized.toArray().toArray(1);
+var pcNames = ee.List.sequence(1, nComponents).map(function(i) {
+  return ee.String('PC').cat(ee.Number(i).int().format('%d'));
+});
+
+var pcImage = ee.Image(eigenVectors.slice(0, 0, nComponents))
+  .matrixMultiply(arrayImage)
+  .arrayProject([0])
+  .arrayFlatten([pcNames])
+  .updateMask(cropMask);
+
+print('PCA complete: 18 phenology bands → ' + nComponents + ' PCs (Kharif 2025)');
+
+Export.image.toDrive({
+  image: pcImage,
+  description: 'Varanasi_Kharif_2025_18feat_PCA_Drive',
+  folder: 'gee_exports',
+  fileNamePrefix: 'Varanasi_PCA_8bands_Kharif_2025',
+  scale: 20,
+  crs: 'EPSG:32644',
+  maxPixels: 1e13,
+  region: roi
+});
+
+// print('✅ EXPORT QUEUED (Drive): Varanasi_PCA_8bands_Kharif_2025.tif');
+
+// var pc1_loadings = eigenVectors.slice(0, 0, 1).project([1]);
+// var pc2_loadings = eigenVectors.slice(0, 1, 2).project([1]);
+
+// print('Band order:', bandNames);
+// print('PC1 loadings (which bands drive PC1):', pc1_loadings);
+// print('PC2 loadings (which bands drive PC2):', pc2_loadings);
